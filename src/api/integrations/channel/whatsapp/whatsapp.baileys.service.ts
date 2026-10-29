@@ -224,6 +224,23 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+const editIdentityNamespace = (key: Partial<WAMessageKey>) => {
+  const jids = [key.remoteJid, key.participant, key.remoteJidAlt, key.participantAlt].filter(
+    (jid): jid is string => !!jid,
+  );
+  if (jids.some((jid) => jid.endsWith('@lid'))) return 'lid';
+  if (jids.some((jid) => jid.endsWith('@s.whatsapp.net'))) return 'phone';
+  return 'other';
+};
+
+const logWhatsappEdit = (
+  logger: { info: (record: Record<string, boolean | string>) => void },
+  stage: string,
+  fields: Record<string, boolean | string>,
+) => {
+  logger.info({ diagnostic: 'whatsapp_edit', stage, ...fields });
+};
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -587,20 +604,22 @@ export class BaileysStartupService extends ChannelStartupService {
       return undefined;
     }
 
-    const exact = rows.map((row) => ({
-      row,
-      key: typeof row.key === 'string' ? JSON.parse(row.key) : row.key,
-    })).filter(({ row, key: storedKey }) => {
-      return (
-        row.instanceId === this.instanceId &&
-        storedKey?.id === key.id &&
-        storedKey.remoteJid === key.remoteJid &&
-        storedKey.fromMe === key.fromMe &&
-        (storedKey.participant || '') === (key.participant || '') &&
-        (storedKey.remoteJidAlt || '') === (key.remoteJidAlt || '') &&
-        (storedKey.participantAlt || '') === (key.participantAlt || '')
-      );
-    });
+    const exact = rows
+      .map((row) => ({
+        row,
+        key: typeof row.key === 'string' ? JSON.parse(row.key) : row.key,
+      }))
+      .filter(({ row, key: storedKey }) => {
+        return (
+          row.instanceId === this.instanceId &&
+          storedKey?.id === key.id &&
+          storedKey.remoteJid === key.remoteJid &&
+          storedKey.fromMe === key.fromMe &&
+          (storedKey.participant || '') === (key.participant || '') &&
+          (storedKey.remoteJidAlt || '') === (key.remoteJidAlt || '') &&
+          (storedKey.participantAlt || '') === (key.participantAlt || '')
+        );
+      });
     if (exact.length !== 1) return undefined;
 
     const { row, key: storedKey } = exact[0];
@@ -1617,28 +1636,73 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'messages.update': async (args: { update: Partial<WAMessage>; key: WAMessageKey }[], settings: any) => {
-      this.logger.verbose(`Update messages received: ${args.length}`);
+      this.logger.verbose('messages.update handler entered');
 
       const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
 
       for await (const { key, update } of args) {
-        if (settings?.groupsIgnore && key.remoteJid?.includes('@g.us')) {
+        const isEdit = !!update.message?.editedMessage?.message;
+        if (isEdit) {
+          logWhatsappEdit(this.logger, 'evolution_handler_entry', {
+            message_id_present: !!key.id,
+            identity_namespace: editIdentityNamespace(key),
+            direction_known: typeof key.fromMe === 'boolean',
+            from_me: key.fromMe === true,
+          });
+        }
+        if (isEdit && !key.id) {
+          logWhatsappEdit(this.logger, 'handler_skip', { reason: 'missing_message_id' });
+          continue;
+        }
+        if (isEdit && !key.remoteJid) {
+          logWhatsappEdit(this.logger, 'handler_skip', { reason: 'missing_chat_identity' });
           continue;
         }
 
-        const isEdit = !!update.message?.editedMessage?.message;
-        const originalEdit = isEdit ? await this.getMessageForEdit(key) : undefined;
+        if (settings?.groupsIgnore && key.remoteJid?.includes('@g.us')) {
+          if (isEdit) logWhatsappEdit(this.logger, 'handler_skip', { reason: 'groups_ignored' });
+          continue;
+        }
+
+        let originalEdit: WAMessage | undefined;
+        if (isEdit) {
+          logWhatsappEdit(this.logger, 'original_lookup_start', {
+            message_id_present: !!key.id,
+            chat_key_present: !!key.remoteJid,
+            direction_known: typeof key.fromMe === 'boolean',
+          });
+          try {
+            originalEdit = await this.getMessageForEdit(key);
+          } catch (error) {
+            logWhatsappEdit(this.logger, 'original_lookup_result', { result: 'error' });
+            throw error;
+          }
+          logWhatsappEdit(this.logger, 'original_lookup_result', {
+            result: originalEdit ? 'matched' : 'no_exact_match',
+          });
+        }
         if (isEdit && !originalEdit) {
+          logWhatsappEdit(this.logger, 'handler_skip', { reason: 'exact_original_unavailable' });
           this.logger.warn('Edit update skipped: exact original message not found');
           continue;
         }
 
         const editDigest = isEdit
           ? createHash('sha256')
-              .update(JSON.stringify([key.id, key.remoteJid, key.fromMe, key.participant, update.message!.editedMessage!.message]))
+              .update(
+                JSON.stringify([
+                  key.id,
+                  key.remoteJid,
+                  key.fromMe,
+                  key.participant,
+                  update.message!.editedMessage!.message,
+                ]),
+              )
               .digest('hex')
           : undefined;
-        const updateKey = isEdit ? `${this.instance.id}_edit_${editDigest}` : `${this.instance.id}_${key.id}_${update.status}`;
+        const updateKey = isEdit
+          ? `${this.instance.id}_edit_${editDigest}`
+          : `${this.instance.id}_${key.id}_${update.status}`;
 
         const cached = await this.baileysCache.get(updateKey);
 
@@ -1646,11 +1710,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (
           (isEdit && cached === true) ||
-          (!isEdit &&
-          (update.messageTimestamp && update.messageTimestamp === cached) ||
-          (!update.messageTimestamp && secondsSinceEpoch === cached))
+          (!isEdit && update.messageTimestamp && update.messageTimestamp === cached) ||
+          (!update.messageTimestamp && secondsSinceEpoch === cached)
         ) {
-          this.logger.info(`Update Message duplicated ignored [avoid deadlock]: ${updateKey}`);
+          if (isEdit) {
+            logWhatsappEdit(this.logger, 'handler_skip', { reason: 'duplicate_cache' });
+          } else {
+            this.logger.info(`Update Message duplicated ignored [avoid deadlock]: ${updateKey}`);
+          }
           continue;
         }
 
@@ -1691,7 +1758,7 @@ export class BaileysStartupService extends ChannelStartupService {
             remoteJid: key?.remoteJid,
             fromMe: key.fromMe,
             participant: key?.participant,
-            status: isEdit ? 'EDITED' : status[update.status] ?? 'SERVER_ACK',
+            status: isEdit ? 'EDITED' : (status[update.status] ?? 'SERVER_ACK'),
             pollUpdates,
             instanceId: this.instanceId,
           };
@@ -1779,12 +1846,21 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          if (isEdit) logWhatsappEdit(this.logger, 'webhook_dispatch_start', { event: 'messages.update' });
           this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { message: _msg, ...messageData } = message;
-            await this.prismaRepository.messageUpdate.create({ data: messageData });
+            try {
+              await this.prismaRepository.messageUpdate.create({ data: messageData });
+              if (isEdit) logWhatsappEdit(this.logger, 'message_update_persistence', { result: 'success' });
+            } catch (error) {
+              if (isEdit) logWhatsappEdit(this.logger, 'message_update_persistence', { result: 'error' });
+              throw error;
+            }
+          } else if (isEdit) {
+            logWhatsappEdit(this.logger, 'message_update_persistence', { result: 'disabled' });
           }
 
           if (isEdit) continue;
