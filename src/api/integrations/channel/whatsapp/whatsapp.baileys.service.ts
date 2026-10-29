@@ -573,6 +573,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private async getMessageForEdit(key: WAMessageKey): Promise<WAMessage | undefined> {
     if (!key.id || !key.remoteJid || typeof key.fromMe !== 'boolean') return undefined;
 
+    // The encrypted target is proto.MessageKey; alternate JIDs exist only on received WAMessage keys.
     const provider = this.configService.get<Database>('DATABASE').PROVIDER;
     let rows: any[];
 
@@ -584,8 +585,6 @@ export class BaileysStartupService extends ChannelStartupService {
           AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ${key.remoteJid}
           AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = ${String(key.fromMe)}
           AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.participant')), '') = ${key.participant || ''}
-          AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJidAlt')), '') = ${key.remoteJidAlt || ''}
-          AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.participantAlt')), '') = ${key.participantAlt || ''}
         LIMIT 2
       `;
     } else if (provider === 'postgresql' || provider === 'psql_bouncer') {
@@ -596,8 +595,6 @@ export class BaileysStartupService extends ChannelStartupService {
           AND "key"->>'remoteJid' = ${key.remoteJid}
           AND "key"->>'fromMe' = ${String(key.fromMe)}
           AND COALESCE("key"->>'participant', '') = ${key.participant || ''}
-          AND COALESCE("key"->>'remoteJidAlt', '') = ${key.remoteJidAlt || ''}
-          AND COALESCE("key"->>'participantAlt', '') = ${key.participantAlt || ''}
         LIMIT 2
       `;
     } else {
@@ -615,9 +612,7 @@ export class BaileysStartupService extends ChannelStartupService {
           storedKey?.id === key.id &&
           storedKey.remoteJid === key.remoteJid &&
           storedKey.fromMe === key.fromMe &&
-          (storedKey.participant || '') === (key.participant || '') &&
-          (storedKey.remoteJidAlt || '') === (key.remoteJidAlt || '') &&
-          (storedKey.participantAlt || '') === (key.participantAlt || '')
+          (storedKey.participant || '') === (key.participant || '')
         );
       });
     if (exact.length !== 1) return undefined;
