@@ -553,6 +553,66 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  private async getMessageForEdit(key: WAMessageKey): Promise<WAMessage | undefined> {
+    if (!key.id || !key.remoteJid || typeof key.fromMe !== 'boolean') return undefined;
+
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    let rows: any[];
+
+    if (provider === 'mysql') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM Message
+        WHERE instanceId = ${this.instanceId}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${key.id}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ${key.remoteJid}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = ${String(key.fromMe)}
+          AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.participant')), '') = ${key.participant || ''}
+          AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJidAlt')), '') = ${key.remoteJidAlt || ''}
+          AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.participantAlt')), '') = ${key.participantAlt || ''}
+        LIMIT 2
+      `;
+    } else if (provider === 'postgresql' || provider === 'psql_bouncer') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'id' = ${key.id}
+          AND "key"->>'remoteJid' = ${key.remoteJid}
+          AND "key"->>'fromMe' = ${String(key.fromMe)}
+          AND COALESCE("key"->>'participant', '') = ${key.participant || ''}
+          AND COALESCE("key"->>'remoteJidAlt', '') = ${key.remoteJidAlt || ''}
+          AND COALESCE("key"->>'participantAlt', '') = ${key.participantAlt || ''}
+        LIMIT 2
+      `;
+    } else {
+      return undefined;
+    }
+
+    const exact = rows.map((row) => ({
+      row,
+      key: typeof row.key === 'string' ? JSON.parse(row.key) : row.key,
+    })).filter(({ row, key: storedKey }) => {
+      return (
+        row.instanceId === this.instanceId &&
+        storedKey?.id === key.id &&
+        storedKey.remoteJid === key.remoteJid &&
+        storedKey.fromMe === key.fromMe &&
+        (storedKey.participant || '') === (key.participant || '') &&
+        (storedKey.remoteJidAlt || '') === (key.remoteJidAlt || '') &&
+        (storedKey.participantAlt || '') === (key.participantAlt || '')
+      );
+    });
+    if (exact.length !== 1) return undefined;
+
+    const { row, key: storedKey } = exact[0];
+    const message = this.deserializeMessageBuffers(row.message);
+    const secret = message?.messageContextInfo?.messageSecret;
+    if (secret?.type === 'Buffer' && Array.isArray(secret.data)) {
+      message.messageContextInfo.messageSecret = Uint8Array.from(secret.data);
+    }
+
+    return { ...row, key: storedKey, message } as WAMessage;
+  }
+
   private async defineAuthState() {
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
@@ -647,6 +707,7 @@ export class BaileysStartupService extends ChannelStartupService {
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
+      getMessageForEdit: async (key) => this.getMessageForEdit(key),
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
       retryRequestDelayMs: 350,
@@ -1556,7 +1617,7 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'messages.update': async (args: { update: Partial<WAMessage>; key: WAMessageKey }[], settings: any) => {
-      this.logger.verbose(`Update messages ${JSON.stringify(args, undefined, 2)}`);
+      this.logger.verbose(`Update messages received: ${args.length}`);
 
       const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
 
@@ -1565,22 +1626,37 @@ export class BaileysStartupService extends ChannelStartupService {
           continue;
         }
 
-        const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
+        const isEdit = !!update.message?.editedMessage?.message;
+        const originalEdit = isEdit ? await this.getMessageForEdit(key) : undefined;
+        if (isEdit && !originalEdit) {
+          this.logger.warn('Edit update skipped: exact original message not found');
+          continue;
+        }
+
+        const editDigest = isEdit
+          ? createHash('sha256')
+              .update(JSON.stringify([key.id, key.remoteJid, key.fromMe, key.participant, update.message!.editedMessage!.message]))
+              .digest('hex')
+          : undefined;
+        const updateKey = isEdit ? `${this.instance.id}_edit_${editDigest}` : `${this.instance.id}_${key.id}_${update.status}`;
 
         const cached = await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
-        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
 
         if (
+          (isEdit && cached === true) ||
+          (!isEdit &&
           (update.messageTimestamp && update.messageTimestamp === cached) ||
-          (!update.messageTimestamp && secondsSinceEpoch === cached)
+          (!update.messageTimestamp && secondsSinceEpoch === cached))
         ) {
           this.logger.info(`Update Message duplicated ignored [avoid deadlock]: ${updateKey}`);
           continue;
         }
 
-        if (update.messageTimestamp) {
+        if (isEdit) {
+          await this.baileysCache.set(updateKey, true, 30 * 60);
+        } else if (update.messageTimestamp) {
           await this.baileysCache.set(updateKey, update.messageTimestamp, 30 * 60);
         } else {
           await this.baileysCache.set(updateKey, secondsSinceEpoch, 30 * 60);
@@ -1615,7 +1691,7 @@ export class BaileysStartupService extends ChannelStartupService {
             remoteJid: key?.remoteJid,
             fromMe: key.fromMe,
             participant: key?.participant,
-            status: status[update.status] ?? 'SERVER_ACK',
+            status: isEdit ? 'EDITED' : status[update.status] ?? 'SERVER_ACK',
             pollUpdates,
             instanceId: this.instanceId,
           };
@@ -1624,9 +1700,9 @@ export class BaileysStartupService extends ChannelStartupService {
             message.message = update.message;
           }
 
-          let findMessage: any;
+          let findMessage: any = originalEdit;
           const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
-          if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
+          if (!isEdit && (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE)) {
             // Use raw SQL to avoid JSON path issues
             const protocolMapKey = `protocol_${key.id}`;
             const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
@@ -1652,6 +1728,10 @@ export class BaileysStartupService extends ChannelStartupService {
             message.messageId = findMessage.id;
           }
 
+          if (isEdit && originalEdit) {
+            message.messageId = (originalEdit as any).id;
+          }
+
           if (update.message === null && update.status === undefined) {
             this.sendDataWebhook(Events.MESSAGES_DELETE, { ...key, status: 'DELETED' });
 
@@ -1669,7 +1749,7 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          if (findMessage && update.status !== undefined && status[update.status] !== findMessage.status) {
+          if (!isEdit && findMessage && update.status !== undefined && status[update.status] !== findMessage.status) {
             if (!key.fromMe && key.remoteJid) {
               readChatToUpdate[key.remoteJid] = true;
 
@@ -1706,6 +1786,8 @@ export class BaileysStartupService extends ChannelStartupService {
             const { message: _msg, ...messageData } = message;
             await this.prismaRepository.messageUpdate.create({ data: messageData });
           }
+
+          if (isEdit) continue;
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
