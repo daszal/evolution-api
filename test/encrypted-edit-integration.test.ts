@@ -485,3 +485,168 @@ test('only an explicit Baileys REVOKE stub is forwarded as Delete for Everyone',
   );
   assert.equal(eventCalls.filter((call) => call[0] === Events.MESSAGES_DELETE).length, 3);
 });
+
+test('non-edit protocol upserts are not treated as edits before the deletion update', async () => {
+  const originalRow = { ...storedRow(), messageTimestamp: 1_793_000_000 };
+  const eventCalls: unknown[][] = [];
+  const updateRows: any[] = [];
+  const databaseUpdates: any[] = [];
+  const chatLookups: any[] = [];
+  const cacheValues = new Map<string, unknown>();
+  const config = {
+    get: (key: string) => {
+      if (key === 'DATABASE') {
+        return {
+          PROVIDER: 'postgresql',
+          SAVE_DATA: { MESSAGE_UPDATE: true, HISTORIC: false, NEW_MESSAGE: false },
+        };
+      }
+      if (key === 'CHATWOOT') return { ENABLED: false };
+      if (key === 'LOG') return { BAILEYS: 'error' };
+      return {};
+    },
+  };
+  const repository = {
+    $queryRaw: async () => [originalRow],
+    messageUpdate: { create: async (input: any) => updateRows.push(input.data) },
+    message: {
+      update: async (input: any) => {
+        databaseUpdates.push(input);
+        Object.assign(originalRow, input.data);
+      },
+    },
+    chat: { findFirst: async (input: any) => chatLookups.push(input) },
+  };
+  const cache = {
+    get: async (key: string) => cacheValues.get(key),
+    set: async (key: string, value: unknown) => cacheValues.set(key, value),
+  };
+  const previousConnection = postgresClient.getChatwootConnection;
+  postgresClient.getChatwootConnection = (() => ({})) as any;
+
+  let service: any;
+  try {
+    service = new (BaileysStartupService as any)(config, {}, repository, {}, {}, cache, {});
+  } finally {
+    postgresClient.getChatwootConnection = previousConnection;
+  }
+  service.instance = { name: 'synthetic-instance', id: 'synthetic-instance' };
+  service.logger = { verbose: () => {}, info: () => {}, warn: () => {}, error: () => {}, log: () => {} };
+  service.getMessage = async () => originalRow;
+  service.sendDataWebhook = async (...args: unknown[]) => eventCalls.push(args);
+
+  const revokeTargetKey = { id: targetKey.id, remoteJid: 'synthetic-self@lid', fromMe: true };
+  const notification = {
+    key: { ...targetKey, id: 'SYNTHETIC_REVOKE_NOTIFICATION_ID' },
+    message: { protocolMessage: { type: proto.Message.ProtocolMessage.Type.REVOKE, key: revokeTargetKey } },
+    messageTimestamp: 1_793_300_000,
+  };
+  const revokeUpdate = {
+    key: { ...targetKey },
+    revokeTargetKey,
+    update: { message: null, messageStubType: proto.WebMessageInfo.StubType.REVOKE },
+  };
+
+  await service.messageHandle['messages.upsert']({ messages: [notification], type: 'notify' }, {});
+  await service.messageHandle['messages.upsert']({ messages: [notification], type: 'notify' }, {});
+  await service.messageHandle['messages.upsert'](
+    {
+      type: 'notify',
+      messages: [
+        {
+          key: { ...targetKey, id: 'SYNTHETIC_EPHEMERAL_NOTIFICATION_ID' },
+          message: {
+            protocolMessage: {
+              type: proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING,
+              ephemeralExpiration: 60,
+            },
+          },
+          messageTimestamp: 1_793_300_000,
+        },
+      ],
+    },
+    {},
+  );
+  await service.messageHandle['messages.update']([revokeUpdate], {});
+  await service.messageHandle['messages.update']([revokeUpdate], {});
+
+  assert.deepEqual(eventCalls.map((call) => call[0]), [Events.MESSAGES_DELETE]);
+  assert.equal(databaseUpdates.length, 0);
+  assert.equal(updateRows.length, 1);
+  assert.equal(updateRows[0].status, 'DELETED');
+  assert.equal(originalRow.messageTimestamp, 1_793_000_000);
+  assert.equal(originalRow.status, undefined);
+  assert.equal(chatLookups.length, 0);
+});
+
+test('legacy upsert edit handling still accepts only a genuine MESSAGE_EDIT', async () => {
+  const originalRow = { ...storedRow(), messageTimestamp: 1_793_000_000 };
+  const eventCalls: unknown[][] = [];
+  const updateRows: any[] = [];
+  const databaseUpdates: any[] = [];
+  const config = {
+    get: (key: string) => {
+      if (key === 'DATABASE') {
+        return {
+          PROVIDER: 'postgresql',
+          SAVE_DATA: { MESSAGE_UPDATE: true, HISTORIC: false, NEW_MESSAGE: false },
+        };
+      }
+      if (key === 'CHATWOOT') return { ENABLED: false };
+      if (key === 'LOG') return { BAILEYS: 'error' };
+      return {};
+    },
+  };
+  const repository = {
+    $queryRaw: async () => [originalRow],
+    messageUpdate: { create: async (input: any) => updateRows.push(input.data) },
+    message: {
+      update: async (input: any) => {
+        databaseUpdates.push(input);
+        Object.assign(originalRow, input.data);
+      },
+    },
+  };
+  const cache = { get: async () => undefined, set: async () => undefined };
+  const previousConnection = postgresClient.getChatwootConnection;
+  postgresClient.getChatwootConnection = (() => ({})) as any;
+
+  let service: any;
+  try {
+    service = new (BaileysStartupService as any)(config, {}, repository, {}, {}, cache, {});
+  } finally {
+    postgresClient.getChatwootConnection = previousConnection;
+  }
+  service.instance = { name: 'synthetic-instance', id: 'synthetic-instance' };
+  service.logger = { verbose: () => {}, info: () => {}, warn: () => {}, error: () => {}, log: () => {} };
+  service.getMessage = async () => originalRow;
+  service.sendDataWebhook = async (...args: unknown[]) => eventCalls.push(args);
+
+  await service.messageHandle['messages.upsert'](
+    {
+      type: 'notify',
+      messages: [
+        {
+          key: { ...targetKey, id: 'SYNTHETIC_EDIT_NOTIFICATION_ID' },
+          message: {
+            protocolMessage: {
+              type: proto.Message.ProtocolMessage.Type.MESSAGE_EDIT,
+              key: { ...targetKey },
+              editedMessage: { conversation: 'synthetic edited body' },
+            },
+          },
+          messageTimestamp: 1_793_300_000,
+        },
+      ],
+    },
+    {},
+  );
+
+  assert.equal(eventCalls.length, 1);
+  assert.equal(eventCalls[0][0], Events.MESSAGES_EDITED);
+  assert.equal(databaseUpdates.length, 1);
+  assert.equal(databaseUpdates[0].data.status, 'EDITED');
+  assert.equal(databaseUpdates[0].data.messageTimestamp, 1_793_300_000);
+  assert.equal(updateRows.length, 1);
+  assert.equal(updateRows[0].status, 'EDITED');
+});

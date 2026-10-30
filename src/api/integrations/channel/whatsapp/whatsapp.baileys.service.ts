@@ -1371,8 +1371,12 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const editedMessage =
+          const protocolMessage =
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+          if (protocolMessage && protocolMessage.type !== proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+            continue;
+          }
+          const editedMessage = protocolMessage;
 
           if (editedMessage) {
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
