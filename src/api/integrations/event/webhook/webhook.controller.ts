@@ -1,7 +1,7 @@
 import { EventDto } from '@api/integrations/event/event.dto';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
-import { wa } from '@api/types/wa.types';
+import { Events, wa } from '@api/types/wa.types';
 import { configService, Log, Webhook } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 // import { BadRequestException } from '@exceptions';
@@ -9,6 +9,16 @@ import axios, { AxiosInstance } from 'axios';
 import * as jwt from 'jsonwebtoken';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
+
+const editHttpOutcome = (status?: number) => {
+  if (status === 401) return 'unauthorized';
+  if (status === 403) return 'forbidden';
+  if (status === 422) return 'unprocessable';
+  if (status && status >= 200 && status < 300) return 'success';
+  if (status && status >= 400 && status < 500) return 'client_error';
+  if (status && status >= 500) return 'server_error';
+  return 'network_error';
+};
 
 export class WebhookController extends EventController implements EventControllerInterface {
   private readonly logger = new Logger('WebhookController');
@@ -67,6 +77,7 @@ export class WebhookController extends EventController implements EventControlle
     integration,
     extra,
   }: EmitData): Promise<void> {
+    const isMessageUpdate = event === Events.MESSAGES_UPDATE && (data as any)?.status === 'EDITED';
     if (integration && !integration.includes('webhook')) {
       return;
     }
@@ -102,6 +113,19 @@ export class WebhookController extends EventController implements EventControlle
       apikey: apiKey,
     };
 
+    if (isMessageUpdate) {
+      this.logger.info({
+        diagnostic: 'whatsapp_edit',
+        stage: 'webhook_configuration',
+        local_enabled: Boolean(instance?.enabled),
+        local_subscribed: Array.isArray(webhookLocal) && webhookLocal.includes(we),
+        local_destination_configured: Boolean(instance?.url),
+        local_by_event_route: Boolean(instance?.webhookByEvents),
+        global_enabled: Boolean(webhookConfig.GLOBAL?.ENABLED),
+        global_subscribed: Boolean(webhookConfig.EVENTS[we]),
+      });
+    }
+
     if (local && instance?.enabled) {
       if (Array.isArray(webhookLocal) && webhookLocal.includes(we)) {
         let baseURL: string;
@@ -112,7 +136,15 @@ export class WebhookController extends EventController implements EventControlle
           baseURL = instance?.url;
         }
 
-        if (enabledLog) {
+        if (enabledLog && isMessageUpdate) {
+          this.logger.log({
+            diagnostic: 'whatsapp_edit',
+            stage: 'webhook_dispatch',
+            target: 'local',
+            selected: true,
+            by_event_route: Boolean(instance?.webhookByEvents),
+          });
+        } else if (enabledLog) {
           const logData = {
             local: `${origin}.sendData-Webhook`,
             url: baseURL,
@@ -131,20 +163,35 @@ export class WebhookController extends EventController implements EventControlle
             });
 
             await this.retryWebhookRequest(httpService, webhookData, `${origin}.sendData-Webhook`, baseURL, serverUrl);
+          } else if (isMessageUpdate) {
+            this.logger.warn({
+              diagnostic: 'whatsapp_edit',
+              stage: 'webhook_dispatch',
+              target: 'local',
+              outcome: 'invalid_target',
+            });
           }
         } catch (error) {
-          this.logger.error({
-            local: `${origin}.sendData-Webhook`,
-            message: `Todas as tentativas falharam: ${error?.message}`,
-            hostName: error?.hostname,
-            syscall: error?.syscall,
-            code: error?.code,
-            error: error?.errno,
-            stack: error?.stack,
-            name: error?.name,
-            url: baseURL,
-            server_url: serverUrl,
-          });
+          if (isMessageUpdate) {
+            this.logger.error({
+              diagnostic: 'whatsapp_edit',
+              stage: 'webhook_dispatch',
+              target: 'local',
+              outcome: 'failed',
+            });
+          } else
+            this.logger.error({
+              local: `${origin}.sendData-Webhook`,
+              message: `Todas as tentativas falharam: ${error?.message}`,
+              hostName: error?.hostname,
+              syscall: error?.syscall,
+              code: error?.code,
+              error: error?.errno,
+              stack: error?.stack,
+              name: error?.name,
+              url: baseURL,
+              server_url: serverUrl,
+            });
         }
       }
     }
@@ -157,7 +204,15 @@ export class WebhookController extends EventController implements EventControlle
           globalURL = `${globalURL}/${transformedWe}`;
         }
 
-        if (enabledLog) {
+        if (enabledLog && isMessageUpdate) {
+          this.logger.log({
+            diagnostic: 'whatsapp_edit',
+            stage: 'webhook_dispatch',
+            target: 'global',
+            selected: true,
+            by_event_route: Boolean(webhookConfig.GLOBAL.WEBHOOK_BY_EVENTS),
+          });
+        } else if (enabledLog) {
           const logData = {
             local: `${origin}.sendData-Webhook-Global`,
             url: globalURL,
@@ -181,20 +236,35 @@ export class WebhookController extends EventController implements EventControlle
               globalURL,
               serverUrl,
             );
+          } else if (isMessageUpdate) {
+            this.logger.warn({
+              diagnostic: 'whatsapp_edit',
+              stage: 'webhook_dispatch',
+              target: 'global',
+              outcome: 'invalid_target',
+            });
           }
         } catch (error) {
-          this.logger.error({
-            local: `${origin}.sendData-Webhook-Global`,
-            message: `Todas as tentativas falharam: ${error?.message}`,
-            hostName: error?.hostname,
-            syscall: error?.syscall,
-            code: error?.code,
-            error: error?.errno,
-            stack: error?.stack,
-            name: error?.name,
-            url: globalURL,
-            server_url: serverUrl,
-          });
+          if (isMessageUpdate) {
+            this.logger.error({
+              diagnostic: 'whatsapp_edit',
+              stage: 'webhook_dispatch',
+              target: 'global',
+              outcome: 'failed',
+            });
+          } else
+            this.logger.error({
+              local: `${origin}.sendData-Webhook-Global`,
+              message: `Todas as tentativas falharam: ${error?.message}`,
+              hostName: error?.hostname,
+              syscall: error?.syscall,
+              code: error?.code,
+              error: error?.errno,
+              stack: error?.stack,
+              name: error?.name,
+              url: globalURL,
+              server_url: serverUrl,
+            });
         }
       }
     }
@@ -210,6 +280,8 @@ export class WebhookController extends EventController implements EventControlle
     delaySeconds?: number,
   ): Promise<void> {
     const webhookConfig = configService.get<Webhook>('WEBHOOK');
+    const isMessageUpdate = webhookData?.event === Events.MESSAGES_UPDATE && webhookData?.data?.status === 'EDITED';
+    const target = origin.includes('Global') ? 'global' : 'local';
     const maxRetryAttempts = maxRetries ?? webhookConfig.RETRY?.MAX_ATTEMPTS ?? 10;
     const initialDelay = delaySeconds ?? webhookConfig.RETRY?.INITIAL_DELAY_SECONDS ?? 5;
     const useExponentialBackoff = webhookConfig.RETRY?.USE_EXPONENTIAL_BACKOFF ?? true;
@@ -221,13 +293,25 @@ export class WebhookController extends EventController implements EventControlle
 
     while (attempts < maxRetryAttempts) {
       try {
-        await httpService.post('', webhookData);
-        if (attempts > 0) {
-          this.logger.log({
-            local: `${origin}`,
-            message: `Sucesso no envio após ${attempts + 1} tentativas`,
-            url: baseURL,
+        const response = await httpService.post('', webhookData);
+        if (isMessageUpdate) {
+          this.logger.info({
+            diagnostic: 'whatsapp_edit',
+            stage: 'webhook_response',
+            target,
+            outcome: editHttpOutcome(response?.status),
+            retried: attempts > 0,
           });
+        }
+        if (attempts > 0) {
+          if (isMessageUpdate) {
+            this.logger.info({ diagnostic: 'whatsapp_edit', stage: 'webhook_retry', target, outcome: 'recovered' });
+          } else
+            this.logger.log({
+              local: `${origin}`,
+              message: `Sucesso no envio após ${attempts + 1} tentativas`,
+              url: baseURL,
+            });
         }
         return;
       } catch (error) {
@@ -236,30 +320,48 @@ export class WebhookController extends EventController implements EventControlle
         const isTimeout = error.code === 'ECONNABORTED';
 
         if (error?.response?.status && nonRetryableStatusCodes.includes(error.response.status)) {
-          this.logger.error({
-            local: `${origin}`,
-            message: `Erro não recuperável (${error.response.status}): ${error?.message}. Cancelando retentativas.`,
-            statusCode: error?.response?.status,
-            url: baseURL,
-            server_url: serverUrl,
-          });
+          if (isMessageUpdate) {
+            this.logger.error({
+              diagnostic: 'whatsapp_edit',
+              stage: 'webhook_response',
+              target,
+              outcome: editHttpOutcome(error.response.status),
+              retried: attempts > 1,
+            });
+          } else
+            this.logger.error({
+              local: `${origin}`,
+              message: `Erro não recuperável (${error.response.status}): ${error?.message}. Cancelando retentativas.`,
+              statusCode: error?.response?.status,
+              url: baseURL,
+              server_url: serverUrl,
+            });
           throw error;
         }
 
-        this.logger.error({
-          local: `${origin}`,
-          message: `Tentativa ${attempts}/${maxRetryAttempts} falhou: ${isTimeout ? 'Timeout da requisição' : error?.message}`,
-          hostName: error?.hostname,
-          syscall: error?.syscall,
-          code: error?.code,
-          isTimeout,
-          statusCode: error?.response?.status,
-          error: error?.errno,
-          stack: error?.stack,
-          name: error?.name,
-          url: baseURL,
-          server_url: serverUrl,
-        });
+        if (isMessageUpdate) {
+          this.logger.error({
+            diagnostic: 'whatsapp_edit',
+            stage: 'webhook_response',
+            target,
+            outcome: editHttpOutcome(error?.response?.status),
+            retried: attempts > 1,
+          });
+        } else
+          this.logger.error({
+            local: `${origin}`,
+            message: `Tentativa ${attempts}/${maxRetryAttempts} falhou: ${isTimeout ? 'Timeout da requisição' : error?.message}`,
+            hostName: error?.hostname,
+            syscall: error?.syscall,
+            code: error?.code,
+            isTimeout,
+            statusCode: error?.response?.status,
+            error: error?.errno,
+            stack: error?.stack,
+            name: error?.name,
+            url: baseURL,
+            server_url: serverUrl,
+          });
 
         if (attempts === maxRetryAttempts) {
           throw error;
@@ -273,11 +375,20 @@ export class WebhookController extends EventController implements EventControlle
           nextDelay = Math.max(initialDelay, nextDelay + jitter);
         }
 
-        this.logger.log({
-          local: `${origin}`,
-          message: `Aguardando ${nextDelay.toFixed(1)} segundos antes da próxima tentativa`,
-          url: baseURL,
-        });
+        if (isMessageUpdate) {
+          this.logger.info({
+            diagnostic: 'whatsapp_edit',
+            stage: 'webhook_retry',
+            target,
+            outcome: 'waiting',
+            retrying: true,
+          });
+        } else
+          this.logger.log({
+            local: `${origin}`,
+            message: `Aguardando ${nextDelay.toFixed(1)} segundos antes da próxima tentativa`,
+            url: baseURL,
+          });
 
         await new Promise((resolve) => setTimeout(resolve, nextDelay * 1000));
       }

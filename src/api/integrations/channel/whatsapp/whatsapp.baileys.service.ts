@@ -224,6 +224,96 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+const editIdentityNamespace = (key: Partial<WAMessageKey>) => {
+  const jids = [key.remoteJid, key.participant, key.remoteJidAlt, key.participantAlt].filter(
+    (jid): jid is string => !!jid,
+  );
+  if (jids.some((jid) => jid.endsWith('@lid'))) return 'lid';
+  if (jids.some((jid) => jid.endsWith('@s.whatsapp.net'))) return 'phone';
+  return 'other';
+};
+
+const logWhatsappEdit = (
+  logger: { info: (record: Record<string, boolean | string>) => void },
+  stage: string,
+  fields: Record<string, boolean | string>,
+) => {
+  logger.info({ diagnostic: 'whatsapp_edit', stage, ...fields });
+};
+
+const logWhatsappDelete = (
+  logger: { info: (record: Record<string, boolean | string>) => void },
+  stage: string,
+  fields: Record<string, boolean | string>,
+) => {
+  logger.info({ diagnostic: 'whatsapp_delete', stage, ...fields });
+};
+
+const matchesEditIdentity = (received: WAMessageKey, original: WAMessageKey) => {
+  if (received.fromMe !== original.fromMe) return false;
+
+  const group = isJidGroup(received.remoteJid || undefined);
+  const sameRemoteJid =
+    received.remoteJid === original.remoteJid ||
+    (!group &&
+      !received.fromMe &&
+      !!received.remoteJidAlt &&
+      !!original.remoteJidAlt &&
+      received.remoteJid === original.remoteJidAlt &&
+      received.remoteJidAlt === original.remoteJid);
+  if (!sameRemoteJid) return false;
+
+  if (!group) return (received.participant || '') === (original.participant || '');
+  return (
+    !!received.participant &&
+    !!original.participant &&
+    (received.participant === original.participant ||
+      (!!received.participantAlt &&
+        !!original.participantAlt &&
+        received.participant === original.participantAlt &&
+        received.participantAlt === original.participant))
+  );
+};
+
+const matchesRevokeTarget = (notification: WAMessageKey, target: WAMessageKey, original: WAMessageKey) => {
+  if (notification.id !== target.id || original.id !== target.id) return false;
+
+  const notificationIsGroup = isJidGroup(notification.remoteJid || undefined);
+  const targetIsGroup = isJidGroup(target.remoteJid || undefined);
+  const originalIsGroup = isJidGroup(original.remoteJid || undefined);
+  if (notificationIsGroup || targetIsGroup || originalIsGroup) {
+    if (
+      !notificationIsGroup ||
+      !targetIsGroup ||
+      !originalIsGroup ||
+      notification.remoteJid !== target.remoteJid ||
+      notification.remoteJid !== original.remoteJid
+    ) {
+      return false;
+    }
+
+    return Boolean(
+      target.participant &&
+        original.participant &&
+        (target.participant === original.participant ||
+          (target.participantAlt &&
+            original.participantAlt &&
+            target.participant === original.participantAlt &&
+            target.participantAlt === original.participant)),
+    );
+  }
+
+  // In direct chats the revoke envelope has the recipient's perspective, while
+  // the embedded target key is expressed from the original author's side.
+  return matchesEditIdentity(notification, original);
+};
+
+const isConfirmedRevokeUpdate = (update: Partial<WAMessage>, revokeTargetKey?: WAMessageKey) =>
+  update.message === null &&
+  update.status === undefined &&
+  update.messageStubType === proto.WebMessageInfo.StubType.REVOKE &&
+  Boolean(revokeTargetKey?.id);
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -553,6 +643,167 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  private async getMessageForEdit(key: WAMessageKey): Promise<WAMessage | undefined> {
+    if (!key.id || !key.remoteJid || typeof key.fromMe !== 'boolean') return undefined;
+
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    let rows: any[];
+
+    if (provider === 'mysql') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM Message
+        WHERE instanceId = ${this.instanceId}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${key.id}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ${key.remoteJid}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = ${String(key.fromMe)}
+          AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.participant')), '') = ${key.participant || ''}
+        LIMIT 2
+      `;
+    } else if (provider === 'postgresql' || provider === 'psql_bouncer') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'id' = ${key.id}
+          AND "key"->>'remoteJid' = ${key.remoteJid}
+          AND "key"->>'fromMe' = ${String(key.fromMe)}
+          AND COALESCE("key"->>'participant', '') = ${key.participant || ''}
+        LIMIT 2
+      `;
+    } else {
+      return undefined;
+    }
+
+    const exact = rows
+      .map((row) => ({ row, key: typeof row.key === 'string' ? JSON.parse(row.key) : row.key }))
+      .filter(
+        ({ row, key: storedKey }) =>
+          row.instanceId === this.instanceId &&
+          storedKey?.id === key.id &&
+          storedKey.remoteJid === key.remoteJid &&
+          storedKey.fromMe === key.fromMe &&
+          (storedKey.participant || '') === (key.participant || ''),
+      );
+    if (exact.length !== 1) return undefined;
+
+    const { row, key: storedKey } = exact[0];
+    const message = this.deserializeMessageBuffers(row.message);
+    const secret = message?.messageContextInfo?.messageSecret;
+    if (secret?.type === 'Buffer' && Array.isArray(secret.data)) {
+      message.messageContextInfo.messageSecret = Uint8Array.from(secret.data);
+    }
+
+    return { ...row, key: storedKey, message } as WAMessage;
+  }
+
+  private async getMessageForEncryptedEdit(key: WAMessageKey): Promise<WAMessage | undefined> {
+    if (
+      !key.id ||
+      !key.remoteJid ||
+      typeof key.fromMe !== 'boolean' ||
+      (isJidGroup(key.remoteJid) && !key.participant)
+    ) {
+      return undefined;
+    }
+
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    let rows: any[];
+
+    if (provider === 'mysql') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM Message
+        WHERE instanceId = ${this.instanceId}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${key.id}
+      `;
+    } else if (provider === 'postgresql' || provider === 'psql_bouncer') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'id' = ${key.id}
+      `;
+    } else {
+      return undefined;
+    }
+
+    const exact = rows
+      .map((row) => ({
+        row,
+        key: typeof row.key === 'string' ? JSON.parse(row.key) : row.key,
+      }))
+      .filter(({ row, key: storedKey }) => {
+        return row.instanceId === this.instanceId && storedKey?.id === key.id && matchesEditIdentity(key, storedKey);
+      });
+    if (exact.length !== 1) return undefined;
+
+    const { row, key: storedKey } = exact[0];
+    const message = this.deserializeMessageBuffers(row.message);
+    const secret = message?.messageContextInfo?.messageSecret;
+    if (secret?.type === 'Buffer' && Array.isArray(secret.data)) {
+      message.messageContextInfo.messageSecret = Uint8Array.from(secret.data);
+    }
+
+    return { ...row, key: storedKey, message } as WAMessage;
+  }
+
+  private async getMessageForDeletion(
+    notificationKey: WAMessageKey,
+    revokeTargetKey: WAMessageKey,
+  ): Promise<{ message?: WAMessage; result: 'matched' | 'missing' | 'ambiguous' | 'invalid_identity' }> {
+    const isGroup = isJidGroup(notificationKey.remoteJid || undefined);
+    if (
+      !notificationKey.id ||
+      revokeTargetKey?.id !== notificationKey.id ||
+      !notificationKey.remoteJid ||
+      !revokeTargetKey.remoteJid ||
+      typeof notificationKey.fromMe !== 'boolean' ||
+      typeof revokeTargetKey.fromMe !== 'boolean' ||
+      (isGroup && (!notificationKey.participant || !revokeTargetKey.participant)) ||
+      (isGroup !== isJidGroup(revokeTargetKey.remoteJid))
+    ) {
+      return { result: 'invalid_identity' };
+    }
+
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    let rows: any[];
+    if (provider === 'mysql') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM Message
+        WHERE instanceId = ${this.instanceId}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${notificationKey.id}
+      `;
+    } else if (provider === 'postgresql' || provider === 'psql_bouncer') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'id' = ${notificationKey.id}
+      `;
+    } else {
+      return { result: 'missing' };
+    }
+
+    const eligible = rows
+      .map((row) => ({
+        row,
+        key: typeof row.key === 'string' ? JSON.parse(row.key) : row.key,
+      }))
+      .filter(
+        ({ row, key: storedKey }) =>
+          row.instanceId === this.instanceId &&
+          storedKey?.id === notificationKey.id &&
+          matchesRevokeTarget(notificationKey, revokeTargetKey, storedKey),
+      );
+    if (eligible.length === 0) return { result: 'missing' };
+    if (eligible.length !== 1) return { result: 'ambiguous' };
+
+    const { row, key: storedKey } = eligible[0];
+    const message = this.deserializeMessageBuffers(row.message);
+    const secret = message?.messageContextInfo?.messageSecret;
+    if (secret?.type === 'Buffer' && Array.isArray(secret.data)) {
+      message.messageContextInfo.messageSecret = Uint8Array.from(secret.data);
+    }
+
+    return { message: { ...row, key: storedKey, message } as WAMessage, result: 'matched' };
+  }
+
   private async defineAuthState() {
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
@@ -647,6 +898,7 @@ export class BaileysStartupService extends ChannelStartupService {
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
+      getMessageForEdit: async (key) => this.getMessageForEncryptedEdit(key),
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
       retryRequestDelayMs: 350,
@@ -1119,8 +1371,12 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const editedMessage =
+          const protocolMessage =
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+          if (protocolMessage && protocolMessage.type !== proto.Message.ProtocolMessage.Type.MESSAGE_EDIT) {
+            continue;
+          }
+          const editedMessage = protocolMessage;
 
           if (editedMessage) {
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
@@ -1555,34 +1811,154 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     },
 
-    'messages.update': async (args: { update: Partial<WAMessage>; key: WAMessageKey }[], settings: any) => {
-      this.logger.verbose(`Update messages ${JSON.stringify(args, undefined, 2)}`);
+    'messages.update': async (
+      args: { update: Partial<WAMessage>; key: WAMessageKey; revokeTargetKey?: WAMessageKey }[],
+      settings: any,
+    ) => {
+      this.logger.verbose('messages.update handler entered');
 
       const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
 
-      for await (const { key, update } of args) {
-        if (settings?.groupsIgnore && key.remoteJid?.includes('@g.us')) {
+      for await (const { key, update, revokeTargetKey } of args) {
+        const isEdit = !!update.message?.editedMessage?.message;
+        const isDeleteForEveryone = isConfirmedRevokeUpdate(update, revokeTargetKey);
+        if (isEdit) {
+          logWhatsappEdit(this.logger, 'evolution_handler_entry', {
+            message_id_present: !!key.id,
+            identity_namespace: editIdentityNamespace(key),
+            direction_known: typeof key.fromMe === 'boolean',
+            from_me: key.fromMe === true,
+          });
+        }
+        if (update.messageStubType === proto.WebMessageInfo.StubType.REVOKE) {
+          logWhatsappDelete(this.logger, 'evolution_handler_entry', {
+            confirmed_revoke: isDeleteForEveryone,
+            target_key_present: !!revokeTargetKey,
+            target_id_matches_notification: !!revokeTargetKey?.id && revokeTargetKey.id === key.id,
+            conversation_namespace: editIdentityNamespace(key),
+            group_chat: isJidGroup(key.remoteJid || undefined),
+          });
+        }
+        if (isEdit && !key.id) {
+          logWhatsappEdit(this.logger, 'handler_skip', { reason: 'missing_message_id' });
+          continue;
+        }
+        if (update.messageStubType === proto.WebMessageInfo.StubType.REVOKE && !isDeleteForEveryone) {
+          logWhatsappDelete(this.logger, 'handler_skip', { reason: 'invalid_revoke_target' });
+          continue;
+        }
+        if (isEdit && !key.remoteJid) {
+          logWhatsappEdit(this.logger, 'handler_skip', { reason: 'missing_chat_identity' });
           continue;
         }
 
-        const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
+        if (settings?.groupsIgnore && key.remoteJid?.includes('@g.us')) {
+          if (isEdit) logWhatsappEdit(this.logger, 'handler_skip', { reason: 'groups_ignored' });
+          continue;
+        }
+
+        let originalEdit: WAMessage | undefined;
+        if (isEdit) {
+          logWhatsappEdit(this.logger, 'original_lookup_start', {
+            message_id_present: !!key.id,
+            chat_key_present: !!key.remoteJid,
+            direction_known: typeof key.fromMe === 'boolean',
+          });
+          try {
+            originalEdit = await this.getMessageForEdit(key);
+          } catch (error) {
+            logWhatsappEdit(this.logger, 'original_lookup_result', { result: 'error' });
+            throw error;
+          }
+          logWhatsappEdit(this.logger, 'original_lookup_result', {
+            result: originalEdit ? 'matched' : 'no_exact_match',
+          });
+        }
+        let originalDelete: WAMessage | undefined;
+        if (isDeleteForEveryone) {
+          logWhatsappDelete(this.logger, 'original_lookup_start', {
+            message_id_present: !!key.id,
+            chat_key_present: !!key.remoteJid,
+            target_key_present: !!revokeTargetKey,
+          });
+          let lookup: Awaited<ReturnType<typeof this.getMessageForDeletion>>;
+          try {
+            lookup = await this.getMessageForDeletion(key, revokeTargetKey!);
+          } catch {
+            logWhatsappDelete(this.logger, 'original_lookup_result', { result: 'error' });
+            throw new Error('Delete for Everyone original lookup failed');
+          }
+          originalDelete = lookup.message;
+          logWhatsappDelete(this.logger, 'original_lookup_result', { result: lookup.result });
+          if (!originalDelete) {
+            this.logger.warn('Delete for Everyone skipped: unique original message unavailable');
+            continue;
+          }
+        }
+        if (isEdit && !originalEdit) {
+          logWhatsappEdit(this.logger, 'handler_skip', { reason: 'exact_original_unavailable' });
+          this.logger.warn('Edit update skipped: exact original message not found');
+          continue;
+        }
+
+        const editDigest = isEdit
+          ? createHash('sha256')
+              .update(
+                JSON.stringify([
+                  key.id,
+                  key.remoteJid,
+                  key.fromMe,
+                  key.participant,
+                  update.message!.editedMessage!.message,
+                ]),
+              )
+              .digest('hex')
+          : undefined;
+        const deleteDigest = isDeleteForEveryone && originalDelete
+          ? createHash('sha256')
+              .update(
+                JSON.stringify([
+                  originalDelete.key.remoteJid,
+                  originalDelete.key.id,
+                  originalDelete.key.fromMe,
+                  originalDelete.key.participant,
+                  originalDelete.key.remoteJidAlt,
+                  originalDelete.key.participantAlt,
+                ]),
+              )
+              .digest('hex')
+          : undefined;
+        const updateKey = isEdit
+          ? `${this.instance.id}_edit_${editDigest}`
+          : isDeleteForEveryone
+            ? `${this.instance.id}_delete_${deleteDigest}`
+            : `${this.instance.id}_${key.id}_${update.status}`;
 
         const cached = await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
-        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
 
         if (
-          (update.messageTimestamp && update.messageTimestamp === cached) ||
+          (isEdit && cached === true) ||
+          (isDeleteForEveryone && cached === true) ||
+          (!isEdit && update.messageTimestamp && update.messageTimestamp === cached) ||
           (!update.messageTimestamp && secondsSinceEpoch === cached)
         ) {
-          this.logger.info(`Update Message duplicated ignored [avoid deadlock]: ${updateKey}`);
+          if (isEdit) {
+            logWhatsappEdit(this.logger, 'handler_skip', { reason: 'duplicate_cache' });
+          } else if (isDeleteForEveryone) {
+            logWhatsappDelete(this.logger, 'handler_skip', { reason: 'duplicate_cache' });
+          } else {
+            this.logger.info(`Update Message duplicated ignored [avoid deadlock]: ${updateKey}`);
+          }
           continue;
         }
 
-        if (update.messageTimestamp) {
+        if (isEdit) {
+          await this.baileysCache.set(updateKey, true, 30 * 60);
+        } else if (!isDeleteForEveryone && update.messageTimestamp) {
           await this.baileysCache.set(updateKey, update.messageTimestamp, 30 * 60);
-        } else {
+        } else if (!isDeleteForEveryone) {
           await this.baileysCache.set(updateKey, secondsSinceEpoch, 30 * 60);
         }
 
@@ -1610,12 +1986,13 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          const originalKey = originalDelete?.key || key;
           const message: any = {
-            keyId: key.id,
-            remoteJid: key?.remoteJid,
-            fromMe: key.fromMe,
-            participant: key?.participant,
-            status: status[update.status] ?? 'SERVER_ACK',
+            keyId: originalKey.id,
+            remoteJid: originalKey?.remoteJid,
+            fromMe: originalKey.fromMe,
+            participant: originalKey?.participant,
+            status: isEdit ? 'EDITED' : isDeleteForEveryone ? 'DELETED' : (status[update.status] ?? 'SERVER_ACK'),
             pollUpdates,
             instanceId: this.instanceId,
           };
@@ -1624,9 +2001,9 @@ export class BaileysStartupService extends ChannelStartupService {
             message.message = update.message;
           }
 
-          let findMessage: any;
+          let findMessage: any = originalEdit || originalDelete;
           const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
-          if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
+          if (!isEdit && !isDeleteForEveryone && (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE)) {
             // Use raw SQL to avoid JSON path issues
             const protocolMapKey = `protocol_${key.id}`;
             const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
@@ -1652,24 +2029,49 @@ export class BaileysStartupService extends ChannelStartupService {
             message.messageId = findMessage.id;
           }
 
-          if (update.message === null && update.status === undefined) {
-            this.sendDataWebhook(Events.MESSAGES_DELETE, { ...key, status: 'DELETED' });
+          if (isEdit && originalEdit) {
+            message.messageId = (originalEdit as any).id;
+          }
+          if (isDeleteForEveryone && originalDelete) {
+            message.messageId = (originalDelete as any).id;
+          }
 
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE)
-              await this.prismaRepository.messageUpdate.create({ data: message });
+          if (isDeleteForEveryone && originalDelete) {
+            logWhatsappDelete(this.logger, 'webhook_dispatch_start', { event: 'messages.delete' });
+            await this.sendDataWebhook(Events.MESSAGES_DELETE, {
+              id: originalKey.id,
+              remoteJid: originalKey.remoteJid,
+              fromMe: originalKey.fromMe,
+              participant: originalKey.participant,
+              status: 'DELETED',
+            });
+
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+              try {
+                await this.prismaRepository.messageUpdate.create({ data: message });
+                logWhatsappDelete(this.logger, 'message_update_persistence', { result: 'success' });
+              } catch (error) {
+                logWhatsappDelete(this.logger, 'message_update_persistence', { result: 'error' });
+                throw error;
+              }
+            } else {
+              logWhatsappDelete(this.logger, 'message_update_persistence', { result: 'disabled' });
+            }
+
+            await this.baileysCache.set(updateKey, true, 30 * 60);
 
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
               this.chatwootService.eventWhatsapp(
                 Events.MESSAGES_DELETE,
                 { instanceName: this.instance.name, instanceId: this.instanceId },
-                { key: key },
+                { key: originalKey },
               );
             }
 
             continue;
           }
 
-          if (findMessage && update.status !== undefined && status[update.status] !== findMessage.status) {
+          if (!isEdit && findMessage && update.status !== undefined && status[update.status] !== findMessage.status) {
             if (!key.fromMe && key.remoteJid) {
               readChatToUpdate[key.remoteJid] = true;
 
@@ -1699,13 +2101,24 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          if (isEdit) logWhatsappEdit(this.logger, 'webhook_dispatch_start', { event: 'messages.update' });
           this.sendDataWebhook(Events.MESSAGES_UPDATE, message);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { message: _msg, ...messageData } = message;
-            await this.prismaRepository.messageUpdate.create({ data: messageData });
+            try {
+              await this.prismaRepository.messageUpdate.create({ data: messageData });
+              if (isEdit) logWhatsappEdit(this.logger, 'message_update_persistence', { result: 'success' });
+            } catch (error) {
+              if (isEdit) logWhatsappEdit(this.logger, 'message_update_persistence', { result: 'error' });
+              throw error;
+            }
+          } else if (isEdit) {
+            logWhatsappEdit(this.logger, 'message_update_persistence', { result: 'disabled' });
           }
+
+          if (isEdit) continue;
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
