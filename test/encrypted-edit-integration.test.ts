@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { proto } from 'baileys';
 import { postgresClient } from '../src/api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { BaileysStartupService } from '../src/api/integrations/channel/whatsapp/whatsapp.baileys.service';
 import { Events } from '../src/api/types/wa.types';
@@ -254,4 +255,233 @@ test('an accepted edit emits the original key without rewriting its original tim
   assert.equal(databaseUpdates.length, 0);
   assert.equal(updateRows.length, 1);
   assert.equal('message' in updateRows[0], false);
+});
+
+test('Delete for Everyone resolves by active instance, target ID and verified direct conversation identity', async () => {
+  const notificationKey = { ...targetKey, fromMe: false };
+  const revokeTargetKey = {
+    id: targetKey.id,
+    remoteJid: 'synthetic-self@lid',
+    fromMe: true,
+  };
+  const { service, queries } = serviceFor([storedRow()]);
+  const result = await service.getMessageForDeletion(notificationKey, revokeTargetKey);
+
+  assert.equal(result.result, 'matched');
+  assert.equal(result.message.id, 'synthetic-row-id');
+  assert.deepEqual(result.message.key, storedKey);
+  assert.ok(queries[0].values.includes('synthetic-instance'));
+  assert.ok(queries[0].values.includes(targetKey.id));
+  assert.ok(!queries[0].values.includes(notificationKey.remoteJid));
+  assert.ok(!queries[0].values.includes(revokeTargetKey.remoteJid));
+
+  const alternateIdentity = serviceFor([storedRow({
+    key: {
+      remoteJid: 'synthetic-user@s.whatsapp.net',
+      remoteJidAlt: 'synthetic-user@lid',
+      participant: undefined,
+      participantAlt: undefined,
+    },
+  })]);
+  const lidNotification = {
+    ...notificationKey,
+    remoteJid: 'synthetic-user@lid',
+    remoteJidAlt: 'synthetic-user@s.whatsapp.net',
+    participant: undefined,
+    participantAlt: undefined,
+  };
+  assert.equal(
+    (await alternateIdentity.service.getMessageForDeletion(lidNotification, revokeTargetKey)).result,
+    'matched',
+  );
+
+  const wrongSender = serviceFor([storedRow()]);
+  assert.equal(
+    (await wrongSender.service.getMessageForDeletion(
+      { ...notificationKey, fromMe: true },
+      revokeTargetKey,
+    )).result,
+    'missing',
+  );
+});
+
+test('Delete for Everyone supports a group admin revoke by matching the embedded original author', async () => {
+  const notificationKey = {
+    id: targetKey.id,
+    remoteJid: 'synthetic-group@g.us',
+    fromMe: false,
+    participant: 'synthetic-admin@lid',
+  };
+  const revokeTargetKey = {
+    ...notificationKey,
+    fromMe: true,
+    participant: 'synthetic-author@lid',
+  };
+  const originalKey = {
+    ...storedKey,
+    remoteJid: notificationKey.remoteJid,
+    participant: revokeTargetKey.participant,
+    participantAlt: 'synthetic-author@s.whatsapp.net',
+  };
+  const { service } = serviceFor([storedRow({ key: originalKey })]);
+
+  const result = await service.getMessageForDeletion(notificationKey, revokeTargetKey);
+  assert.equal(result.result, 'matched');
+  assert.deepEqual(result.message.key, originalKey);
+
+  const wrongAuthor = serviceFor([storedRow({ key: { ...originalKey, participant: 'other-author@lid' } })]);
+  assert.equal(
+    (await wrongAuthor.service.getMessageForDeletion(notificationKey, revokeTargetKey)).result,
+    'missing',
+  );
+  const wrongTargetAuthor = serviceFor([storedRow({ key: originalKey })]);
+  assert.equal(
+    (await wrongTargetAuthor.service.getMessageForDeletion(notificationKey, {
+      ...revokeTargetKey,
+      participant: 'other-author@lid',
+    })).result,
+    'missing',
+  );
+});
+
+test('Delete for Everyone rejects missing IDs, wrong chats, ambiguous originals and foreign instances', async () => {
+  const invalidId = serviceFor([storedRow()]);
+  assert.equal(
+    (await invalidId.service.getMessageForDeletion(targetKey, { ...targetKey, id: 'other-id' })).result,
+    'invalid_identity',
+  );
+
+  const wrongChat = serviceFor([storedRow({ key: { remoteJid: 'other-user@lid' } })]);
+  assert.equal((await wrongChat.service.getMessageForDeletion(targetKey, targetKey)).result, 'missing');
+
+  const duplicate = serviceFor([storedRow(), storedRow()]);
+  assert.equal((await duplicate.service.getMessageForDeletion(targetKey, targetKey)).result, 'ambiguous');
+
+  const foreignInstance = serviceFor([storedRow()]);
+  foreignInstance.service.instanceId = 'other-instance';
+  assert.equal((await foreignInstance.service.getMessageForDeletion(targetKey, targetKey)).result, 'missing');
+});
+
+test('only an explicit Baileys REVOKE stub is forwarded as Delete for Everyone', async () => {
+  const originalRow = { ...storedRow(), messageTimestamp: 1_793_000_000 };
+  const otherChatRow = {
+    ...storedRow({
+      key: {
+        remoteJid: 'synthetic-other@lid',
+        participant: 'synthetic-other@lid',
+        remoteJidAlt: 'synthetic-other@s.whatsapp.net',
+        participantAlt: 'synthetic-other@s.whatsapp.net',
+      },
+    }),
+    id: 'synthetic-row-id-2',
+    messageTimestamp: 1_793_000_001,
+  };
+  const eventCalls: unknown[][] = [];
+  const updateRows: any[] = [];
+  const cacheValues = new Map<string, unknown>();
+  let failNextPersistence = true;
+  const config = {
+    get: (key: string) => {
+      if (key === 'DATABASE') {
+        return {
+          PROVIDER: 'postgresql',
+          SAVE_DATA: { MESSAGE_UPDATE: true, HISTORIC: false, NEW_MESSAGE: false },
+        };
+      }
+      if (key === 'CHATWOOT') return { ENABLED: false };
+      if (key === 'LOG') return { BAILEYS: 'error' };
+      return {};
+    },
+  };
+  const repository = {
+    $queryRaw: async () => [originalRow, otherChatRow],
+    messageUpdate: {
+      create: async (input: any) => {
+        if (failNextPersistence) {
+          failNextPersistence = false;
+          throw new Error('synthetic persistence failure');
+        }
+        updateRows.push(input.data);
+      },
+    },
+    message: { update: async () => undefined },
+    chat: { findFirst: async () => undefined },
+  };
+  const cache = {
+    get: async (key: string) => cacheValues.get(key),
+    set: async (key: string, value: unknown) => cacheValues.set(key, value),
+  };
+  const previousConnection = postgresClient.getChatwootConnection;
+  postgresClient.getChatwootConnection = (() => ({})) as any;
+
+  let service: any;
+  try {
+    service = new (BaileysStartupService as any)(config, {}, repository, {}, {}, cache, {});
+  } finally {
+    postgresClient.getChatwootConnection = previousConnection;
+  }
+  service.instance = { name: 'synthetic-instance', id: 'synthetic-instance' };
+  const deleteStages: string[] = [];
+  service.logger = {
+    verbose: () => {},
+    info: (record: any) => {
+      if (record?.diagnostic === 'whatsapp_delete') deleteStages.push(`${record.stage}:${record.result || record.reason || ''}`);
+    },
+    warn: () => {},
+    error: () => {},
+    log: () => {},
+  };
+  service.sendDataWebhook = async (...args: unknown[]) => eventCalls.push(args);
+
+  const revoke = {
+    key: { ...targetKey },
+    revokeTargetKey: { ...targetKey },
+    update: { message: null, messageStubType: proto.WebMessageInfo.StubType.REVOKE },
+  };
+  await assert.rejects(service.messageHandle['messages.update']([revoke], {}), /synthetic persistence failure/);
+  assert.equal(eventCalls.length, 1);
+  assert.equal(cacheValues.size, 0);
+
+  await service.messageHandle['messages.update']([revoke], {});
+  await service.messageHandle['messages.update']([revoke], {});
+
+  assert.equal(eventCalls.length, 2, `deletion dispatch stages: ${deleteStages.join(',')}`);
+  assert.equal(eventCalls[0][0], Events.MESSAGES_DELETE);
+  assert.deepEqual(eventCalls[0][1], {
+    id: storedKey.id,
+    remoteJid: storedKey.remoteJid,
+    fromMe: storedKey.fromMe,
+    participant: storedKey.participant,
+    status: 'DELETED',
+  });
+  assert.equal(updateRows.length, 1);
+  assert.equal(updateRows[0].status, 'DELETED');
+  assert.equal(updateRows[0].messageId, 'synthetic-row-id');
+  assert.equal(updateRows[0].keyId, storedKey.id);
+  assert.equal('message' in updateRows[0], false);
+  assert.equal('messageTimestamp' in updateRows[0], false);
+  assert.equal(cacheValues.size, 1);
+  assert.equal(originalRow.messageTimestamp, 1_793_000_000);
+
+  const otherChatNotification = {
+    id: targetKey.id,
+    remoteJid: 'synthetic-other@lid',
+    fromMe: false,
+    participant: 'synthetic-other@lid',
+  };
+  await service.messageHandle['messages.update']([{
+    key: otherChatNotification,
+    revokeTargetKey: { id: targetKey.id, remoteJid: 'synthetic-self@lid', fromMe: true },
+    update: { message: null, messageStubType: proto.WebMessageInfo.StubType.REVOKE },
+  }], {});
+  assert.equal(eventCalls.filter((call) => call[0] === Events.MESSAGES_DELETE).length, 3);
+  assert.equal(updateRows.length, 2);
+  assert.equal(updateRows[1].messageId, 'synthetic-row-id-2');
+  assert.equal((eventCalls[2][1] as any).remoteJid, 'synthetic-other@lid');
+
+  await service.messageHandle['messages.update'](
+    [{ key: { ...targetKey }, update: { message: null } }],
+    {},
+  );
+  assert.equal(eventCalls.filter((call) => call[0] === Events.MESSAGES_DELETE).length, 3);
 });
