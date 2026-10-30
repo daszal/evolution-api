@@ -241,6 +241,32 @@ const logWhatsappEdit = (
   logger.info({ diagnostic: 'whatsapp_edit', stage, ...fields });
 };
 
+const matchesEditIdentity = (received: WAMessageKey, original: WAMessageKey) => {
+  if (received.fromMe !== original.fromMe) return false;
+
+  const group = isJidGroup(received.remoteJid || undefined);
+  const sameRemoteJid =
+    received.remoteJid === original.remoteJid ||
+    (!group &&
+      !received.fromMe &&
+      !!received.remoteJidAlt &&
+      !!original.remoteJidAlt &&
+      received.remoteJid === original.remoteJidAlt &&
+      received.remoteJidAlt === original.remoteJid);
+  if (!sameRemoteJid) return false;
+
+  if (!group) return (received.participant || '') === (original.participant || '');
+  return (
+    !!received.participant &&
+    !!original.participant &&
+    (received.participant === original.participant ||
+      (!!received.participantAlt &&
+        !!original.participantAlt &&
+        received.participant === original.participantAlt &&
+        received.participantAlt === original.participant))
+  );
+};
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -571,9 +597,15 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async getMessageForEdit(key: WAMessageKey): Promise<WAMessage | undefined> {
-    if (!key.id || !key.remoteJid || typeof key.fromMe !== 'boolean') return undefined;
+    if (
+      !key.id ||
+      !key.remoteJid ||
+      typeof key.fromMe !== 'boolean' ||
+      (isJidGroup(key.remoteJid) && !key.participant)
+    ) {
+      return undefined;
+    }
 
-    // The encrypted target is proto.MessageKey; alternate JIDs exist only on received WAMessage keys.
     const provider = this.configService.get<Database>('DATABASE').PROVIDER;
     let rows: any[];
 
@@ -582,20 +614,12 @@ export class BaileysStartupService extends ChannelStartupService {
         SELECT * FROM Message
         WHERE instanceId = ${this.instanceId}
           AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${key.id}
-          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ${key.remoteJid}
-          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = ${String(key.fromMe)}
-          AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.participant')), '') = ${key.participant || ''}
-        LIMIT 2
       `;
     } else if (provider === 'postgresql' || provider === 'psql_bouncer') {
       rows = await this.prismaRepository.$queryRaw`
         SELECT * FROM "Message"
         WHERE "instanceId" = ${this.instanceId}
           AND "key"->>'id' = ${key.id}
-          AND "key"->>'remoteJid' = ${key.remoteJid}
-          AND "key"->>'fromMe' = ${String(key.fromMe)}
-          AND COALESCE("key"->>'participant', '') = ${key.participant || ''}
-        LIMIT 2
       `;
     } else {
       return undefined;
@@ -607,13 +631,7 @@ export class BaileysStartupService extends ChannelStartupService {
         key: typeof row.key === 'string' ? JSON.parse(row.key) : row.key,
       }))
       .filter(({ row, key: storedKey }) => {
-        return (
-          row.instanceId === this.instanceId &&
-          storedKey?.id === key.id &&
-          storedKey.remoteJid === key.remoteJid &&
-          storedKey.fromMe === key.fromMe &&
-          (storedKey.participant || '') === (key.participant || '')
-        );
+        return row.instanceId === this.instanceId && storedKey?.id === key.id && matchesEditIdentity(key, storedKey);
       });
     if (exact.length !== 1) return undefined;
 
