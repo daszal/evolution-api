@@ -47,7 +47,7 @@ const storedRow = (changes: { key?: Record<string, unknown>; secret?: unknown } 
 
 test('edit lookup searches by active instance and ID, then matches the received conversation identity', async () => {
   const { service, queries } = serviceFor([storedRow()]);
-  const result = await service.getMessageForEdit(targetKey);
+  const result = await service.getMessageForEncryptedEdit(targetKey);
 
   assert.equal(result.id, 'synthetic-row-id');
   assert.deepEqual(result.key, storedKey);
@@ -64,10 +64,31 @@ test('edit lookup searches by active instance and ID, then matches the received 
   assert.doesNotMatch(queries[0].sql, /"key"->>'(remoteJid|fromMe|participant)'/);
 });
 
+test('plaintext edit lookup retains exact canonical identity predicates', async () => {
+  const { service, queries } = serviceFor([storedRow()]);
+  const result = await service.getMessageForEdit(targetKey);
+
+  assert.equal(result.id, 'synthetic-row-id');
+  assert.ok(queries[0].values.includes(targetKey.remoteJid));
+  assert.ok(queries[0].values.includes(String(targetKey.fromMe)));
+  assert.ok(queries[0].values.includes(targetKey.participant));
+  assert.match(queries[0].sql, /LIMIT 2/);
+
+  const alternateOnly = serviceFor([storedRow()]);
+  assert.equal(
+    await alternateOnly.service.getMessageForEdit({
+      ...targetKey,
+      remoteJid: 'synthetic-user@s.whatsapp.net',
+      remoteJidAlt: 'synthetic-user@lid',
+    }),
+    undefined,
+  );
+});
+
 test('an ID collision in another chat is filtered by the authenticated received identity', async () => {
   const wrongChat = storedRow({ key: { remoteJid: 'other-user@lid' } });
   const { service } = serviceFor([wrongChat, storedRow()]);
-  const result = await service.getMessageForEdit(targetKey);
+  const result = await service.getMessageForEncryptedEdit(targetKey);
 
   assert.equal(result.id, 'synthetic-row-id');
   assert.deepEqual(result.key, storedKey);
@@ -85,11 +106,11 @@ test('direct LID/PN representations require reciprocal received alternate metada
     remoteJidAlt: 'synthetic-user@s.whatsapp.net',
   };
   const { service } = serviceFor([storedRow({ key: originalLidKey })]);
-  const result = await service.getMessageForEdit(received);
+  const result = await service.getMessageForEncryptedEdit(received);
   assert.deepEqual(result.key, originalLidKey);
 
   const noReciprocal = serviceFor([storedRow({ key: originalLidKey })]);
-  assert.equal(await noReciprocal.service.getMessageForEdit({ ...received, remoteJidAlt: undefined }), undefined);
+  assert.equal(await noReciprocal.service.getMessageForEncryptedEdit({ ...received, remoteJidAlt: undefined }), undefined);
 });
 
 test('wrong ID, chat, direction, duplicate eligible rows and foreign instances fail closed', async () => {
@@ -99,15 +120,15 @@ test('wrong ID, chat, direction, duplicate eligible rows and foreign instances f
     { fromMe: true },
   ]) {
     const { service } = serviceFor([storedRow({ key })]);
-    assert.equal(await service.getMessageForEdit(targetKey), undefined);
+    assert.equal(await service.getMessageForEncryptedEdit(targetKey), undefined);
   }
 
   const { service } = serviceFor([storedRow(), storedRow()]);
-  assert.equal(await service.getMessageForEdit(targetKey), undefined);
+  assert.equal(await service.getMessageForEncryptedEdit(targetKey), undefined);
 
   const foreignInstance = serviceFor([storedRow()]);
   foreignInstance.service.instanceId = 'other-instance';
-  assert.equal(await foreignInstance.service.getMessageForEdit(targetKey), undefined);
+  assert.equal(await foreignInstance.service.getMessageForEncryptedEdit(targetKey), undefined);
 });
 
 test('a group edit from a different participant is rejected', async () => {
@@ -120,7 +141,7 @@ test('a group edit from a different participant is rejected', async () => {
     key: { remoteJid: groupKey.remoteJid, participant: 'other-author@lid' },
   });
   const { service } = serviceFor([wrongSender]);
-  assert.equal(await service.getMessageForEdit(groupKey), undefined);
+  assert.equal(await service.getMessageForEncryptedEdit(groupKey), undefined);
 });
 
 test('group LID/PN sender identity requires a reciprocal participant alternate', async () => {
@@ -137,15 +158,15 @@ test('group LID/PN sender identity requires a reciprocal participant alternate',
     participantAlt: 'synthetic-author@s.whatsapp.net',
   };
   const { service } = serviceFor([storedRow({ key: originalLidKey })]);
-  const result = await service.getMessageForEdit(received);
+  const result = await service.getMessageForEncryptedEdit(received);
   assert.deepEqual(result.key, originalLidKey);
 });
 
 test('invalid lookup keys do not query the database and missing secrets remain missing', async () => {
   const invalid = serviceFor([storedRow()]);
-  assert.equal(await invalid.service.getMessageForEdit({ ...targetKey, id: undefined }), undefined);
-  assert.equal(await invalid.service.getMessageForEdit({ ...targetKey, fromMe: undefined }), undefined);
-  assert.equal(await invalid.service.getMessageForEdit({
+  assert.equal(await invalid.service.getMessageForEncryptedEdit({ ...targetKey, id: undefined }), undefined);
+  assert.equal(await invalid.service.getMessageForEncryptedEdit({ ...targetKey, fromMe: undefined }), undefined);
+  assert.equal(await invalid.service.getMessageForEncryptedEdit({
     ...targetKey,
     remoteJid: 'synthetic-group@g.us',
     participant: undefined,
@@ -153,13 +174,13 @@ test('invalid lookup keys do not query the database and missing secrets remain m
   assert.equal(invalid.queries.length, 0);
 
   const missing = serviceFor([storedRow({ secret: undefined })]);
-  const result = await missing.service.getMessageForEdit(targetKey);
+  const result = await missing.service.getMessageForEncryptedEdit(targetKey);
   assert.equal(result.message.messageContextInfo.messageSecret, undefined);
 });
 
 test('MySQL uses equivalent JSON key predicates', async () => {
   const { service, queries } = serviceFor([storedRow()], 'mysql');
-  assert.ok(await service.getMessageForEdit(targetKey));
+  assert.ok(await service.getMessageForEncryptedEdit(targetKey));
   assert.match(queries[0].sql, /JSON_EXTRACT/);
   assert.ok(queries[0].values.includes('synthetic-instance'));
   assert.ok(queries[0].values.includes(targetKey.id));

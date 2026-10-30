@@ -597,6 +597,58 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async getMessageForEdit(key: WAMessageKey): Promise<WAMessage | undefined> {
+    if (!key.id || !key.remoteJid || typeof key.fromMe !== 'boolean') return undefined;
+
+    const provider = this.configService.get<Database>('DATABASE').PROVIDER;
+    let rows: any[];
+
+    if (provider === 'mysql') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM Message
+        WHERE instanceId = ${this.instanceId}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.id')) = ${key.id}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.remoteJid')) = ${key.remoteJid}
+          AND JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.fromMe')) = ${String(key.fromMe)}
+          AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(\`key\`, '$.participant')), '') = ${key.participant || ''}
+        LIMIT 2
+      `;
+    } else if (provider === 'postgresql' || provider === 'psql_bouncer') {
+      rows = await this.prismaRepository.$queryRaw`
+        SELECT * FROM "Message"
+        WHERE "instanceId" = ${this.instanceId}
+          AND "key"->>'id' = ${key.id}
+          AND "key"->>'remoteJid' = ${key.remoteJid}
+          AND "key"->>'fromMe' = ${String(key.fromMe)}
+          AND COALESCE("key"->>'participant', '') = ${key.participant || ''}
+        LIMIT 2
+      `;
+    } else {
+      return undefined;
+    }
+
+    const exact = rows
+      .map((row) => ({ row, key: typeof row.key === 'string' ? JSON.parse(row.key) : row.key }))
+      .filter(
+        ({ row, key: storedKey }) =>
+          row.instanceId === this.instanceId &&
+          storedKey?.id === key.id &&
+          storedKey.remoteJid === key.remoteJid &&
+          storedKey.fromMe === key.fromMe &&
+          (storedKey.participant || '') === (key.participant || ''),
+      );
+    if (exact.length !== 1) return undefined;
+
+    const { row, key: storedKey } = exact[0];
+    const message = this.deserializeMessageBuffers(row.message);
+    const secret = message?.messageContextInfo?.messageSecret;
+    if (secret?.type === 'Buffer' && Array.isArray(secret.data)) {
+      message.messageContextInfo.messageSecret = Uint8Array.from(secret.data);
+    }
+
+    return { ...row, key: storedKey, message } as WAMessage;
+  }
+
+  private async getMessageForEncryptedEdit(key: WAMessageKey): Promise<WAMessage | undefined> {
     if (
       !key.id ||
       !key.remoteJid ||
@@ -739,7 +791,7 @@ export class BaileysStartupService extends ChannelStartupService {
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
-      getMessageForEdit: async (key) => this.getMessageForEdit(key),
+      getMessageForEdit: async (key) => this.getMessageForEncryptedEdit(key),
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
       retryRequestDelayMs: 350,
